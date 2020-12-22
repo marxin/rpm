@@ -13,6 +13,9 @@
 #endif
 #include <sys/utsname.h>
 #include <sys/resource.h>
+#ifdef ENABLE_OPENMP
+#include <omp.h>
+#endif
 
 #include <rpm/rpmlog.h>
 #include <rpm/rpmmacro.h>
@@ -1041,6 +1044,7 @@ typedef struct rpmzstd_s {
     int level;			/*!< compression level */
     FILE * fp;
     void * _stream;             /*!< ZSTD_{C,D}Stream */
+    void * _thread_pool;        /*!< ZSTD_threadPool */
     size_t nb;
     void * b;
     ZSTD_inBuffer zib;          /*!< ZSTD_inBuffer */
@@ -1117,6 +1121,7 @@ static rpmzstd rpmzstdNew(int fdno, const char *fmode)
 	return NULL;
 
     void * _stream = NULL;
+    void * _thread_pool = NULL;
     size_t nb = 0;
 
     if ((flags & O_ACCMODE) == O_RDONLY) {	/* decompressing */
@@ -1135,6 +1140,17 @@ static rpmzstd rpmzstdNew(int fdno, const char *fmode)
 	if (threads > 0) {
 	    if (ZSTD_isError (ZSTD_CCtx_setParameter(_stream, ZSTD_c_nbWorkers, threads)))
 		rpmlog(RPMLOG_DEBUG, "zstd library does not support multi-threading\n");
+	    else {
+#if defined(ENABLE_OPENMP) && ZSTD_VERSION_NUMBER >= 10407
+		_thread_pool = ZSTD_createThreadPool (omp_get_num_threads ());
+		if (_thread_pool == NULL)
+		    rpmlog(RPMLOG_DEBUG, "zstd thread pool cannot be created\n");
+		else {
+		    if (ZSTD_CCtx_refThreadPool(_stream, _thread_pool) != 0)
+			rpmlog(RPMLOG_DEBUG, "zstd thread pool cannot be used\n");
+		}
+#endif
+	    }
 	}
 
 	nb = ZSTD_CStreamOutSize();
@@ -1146,6 +1162,7 @@ static rpmzstd rpmzstdNew(int fdno, const char *fmode)
     zstd->level = level;
     zstd->fp = fp;
     zstd->_stream = _stream;
+    zstd->_thread_pool = _thread_pool;
     zstd->nb = nb;
     zstd->b = xmalloc(nb);
 
@@ -1292,6 +1309,10 @@ assert(zstd);
 	      rc = 0;
 	} while (xx != 0);
 	ZSTD_freeCCtx(zstd->_stream);
+#if defined(ENABLE_OPENMP) && ZSTD_VERSION_NUMBER >= 10407
+	if (zstd->_thread_pool != NULL)
+	    ZSTD_freeThreadPool (zstd->_thread_pool);
+#endif
     }
 
     if (zstd->fp && fileno(zstd->fp) > 2)
